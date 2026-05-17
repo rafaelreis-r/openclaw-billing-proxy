@@ -23,6 +23,7 @@
  *   node proxy.js [--port 18801] [--config config.json]
  */
 
+const rateLimitMonitor = require('./rate-limit-monitor.js');
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
@@ -738,6 +739,74 @@ function reverseMap(text, config) {
   return r;
 }
 
+function createSseEventTransformer(config) {
+  let currentBlockIsThinking = false;
+  const streamState = new Map();
+  const maxPatternLen = Math.max(
+    1,
+    ...config.reverseMap.map(([sanitized]) => sanitized.length),
+    ...config.toolRenames.map(([, cc]) => cc.length + 2),
+    ...config.propRenames.map(([, renamed]) => renamed.length + 2)
+  );
+
+  function streamReverse(blockIndex, field, value) {
+    const key = blockIndex + ':' + field;
+    const prevRaw = streamState.get(key) || '';
+    const combined = prevRaw + value;
+    const prevMapped = reverseMap(prevRaw, config);
+    const combinedMapped = reverseMap(combined, config);
+    const emit = combinedMapped.slice(prevMapped.length);
+    const keep = Math.max(0, maxPatternLen - 1);
+    streamState.set(key, keep > 0 ? combined.slice(-keep) : '');
+    return emit;
+  }
+
+  return (event) => {
+    let dataIdx = event.startsWith('data: ') ? 0 : event.indexOf('\ndata: ');
+    if (dataIdx === -1) return reverseMap(event, config);
+    if (dataIdx > 0) dataIdx += 1;
+    const dataLineEnd = event.indexOf('\n', dataIdx + 6);
+    const dataStr = dataLineEnd === -1
+      ? event.slice(dataIdx + 6)
+      : event.slice(dataIdx + 6, dataLineEnd);
+
+    let payload;
+    try {
+      payload = JSON.parse(dataStr);
+    } catch (_) {
+      return reverseMap(event, config);
+    }
+
+    if (payload.type === 'content_block_start') {
+      const t = payload.content_block && payload.content_block.type;
+      if (t === 'thinking' || t === 'redacted_thinking') {
+        currentBlockIsThinking = true;
+        return event;
+      }
+      currentBlockIsThinking = false;
+      return reverseMap(event, config);
+    }
+    if (payload.type === 'content_block_stop') {
+      const wasThinking = currentBlockIsThinking;
+      currentBlockIsThinking = false;
+      return wasThinking ? event : reverseMap(event, config);
+    }
+    if (currentBlockIsThinking) return event;
+
+    if (payload.type === 'content_block_delta' && payload.delta && typeof payload.index === 'number') {
+      if (payload.delta.type === 'input_json_delta' && typeof payload.delta.partial_json === 'string') {
+        payload.delta.partial_json = streamReverse(payload.index, 'partial_json', payload.delta.partial_json);
+      } else if (payload.delta.type === 'text_delta' && typeof payload.delta.text === 'string') {
+        payload.delta.text = streamReverse(payload.index, 'text', payload.delta.text);
+      }
+      const rewritten = JSON.stringify(payload);
+      return event.slice(0, dataIdx + 6) + rewritten + (dataLineEnd === -1 ? '' : event.slice(dataLineEnd));
+    }
+
+    return reverseMap(event, config);
+  };
+}
+
 // ─── Server ─────────────────────────────────────────────────────────────────
 function startServer(config) {
   let requestCount = 0;
@@ -825,6 +894,7 @@ function startServer(config) {
       }, (upRes) => {
         const status = upRes.statusCode;
         console.log(`[${ts}] #${reqNum} > ${status}`);
+        try { rateLimitMonitor.recordResponse(status, upRes.headers); } catch (e) { console.error("rate-limit-monitor err:", e.message); }
         if (status !== 200 && status !== 201) {
           const errChunks = [];
           upRes.on('data', c => errChunks.push(c));
@@ -861,38 +931,7 @@ function startServer(config) {
           // don't decode as U+FFFD.
           const decoder = new StringDecoder('utf8');
           let pending = '';
-          let currentBlockIsThinking = false;
-
-          const transformEvent = (event) => {
-            // Locate the data: line (always at the start of an SSE line)
-            let dataIdx = event.startsWith('data: ') ? 0 : event.indexOf('\ndata: ');
-            if (dataIdx === -1) return reverseMap(event, config);
-            if (dataIdx > 0) dataIdx += 1; // skip the leading \n
-            const dataLineEnd = event.indexOf('\n', dataIdx + 6);
-            const dataStr = dataLineEnd === -1
-              ? event.slice(dataIdx + 6)
-              : event.slice(dataIdx + 6, dataLineEnd);
-
-            if (dataStr.indexOf('"type":"content_block_start"') !== -1) {
-              if (dataStr.indexOf('"content_block":{"type":"thinking"') !== -1 ||
-                  dataStr.indexOf('"content_block":{"type":"redacted_thinking"') !== -1) {
-                currentBlockIsThinking = true;
-                return event; // pass through unchanged
-              }
-              currentBlockIsThinking = false;
-              return reverseMap(event, config);
-            }
-            if (dataStr.indexOf('"type":"content_block_stop"') !== -1) {
-              const wasThinking = currentBlockIsThinking;
-              currentBlockIsThinking = false;
-              return wasThinking ? event : reverseMap(event, config);
-            }
-            if (currentBlockIsThinking) {
-              // thinking_delta / signature_delta / etc. inside a thinking block
-              return event;
-            }
-            return reverseMap(event, config);
-          };
+          const transformEvent = createSseEventTransformer(config);
 
           upRes.on('data', (chunk) => {
             pending += decoder.write(chunk);
@@ -974,6 +1013,30 @@ function startServer(config) {
   process.on('SIGTERM', () => process.exit(0));
 }
 
+function applySseReverseMapChunks(chunks, config) {
+  const decoder = new StringDecoder('utf8');
+  let pending = '';
+  let out = '';
+  const transformEvent = createSseEventTransformer(config);
+
+  for (const chunk of chunks) {
+    pending += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8'));
+    let sepIdx;
+    while ((sepIdx = pending.indexOf('\n\n')) !== -1) {
+      const event = pending.slice(0, sepIdx + 2);
+      pending = pending.slice(sepIdx + 2);
+      out += transformEvent(event);
+    }
+  }
+  pending += decoder.end();
+  if (pending.length > 0) out += transformEvent(pending);
+  return out;
+}
+
+module.exports = { loadConfig, reverseMap, applySseReverseMapChunks };
+
 // ─── Main ───────────────────────────────────────────────────────────────────
-const config = loadConfig();
-startServer(config);
+if (require.main === module) {
+  const config = loadConfig();
+  startServer(config);
+}
