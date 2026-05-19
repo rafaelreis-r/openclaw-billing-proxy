@@ -881,6 +881,49 @@ function startServer(config) {
   const startedAt = Date.now();
 
   const server = http.createServer((req, res) => {
+    if (req.url === '/usage' && req.method === 'GET') {
+      try {
+        const oauth = getToken(config.credsPath);
+        const expiresIn = (oauth.expiresAt - Date.now()) / 3600000;
+        const logPath = require('path').join(__dirname, 'logs', 'rate-limit.jsonl');
+        let last = null;
+        try {
+          const buf = require('fs').readFileSync(logPath, 'utf8');
+          const lines = buf.trimEnd().split('\n');
+          for (let i = lines.length - 1; i >= 0; i--) {
+            const ln = lines[i].trim();
+            if (!ln) continue;
+            try { last = JSON.parse(ln); break; } catch (_) {}
+          }
+        } catch (_) {}
+        const u5 = last && typeof last.u5 === 'number' ? last.u5 : null;
+        const u7 = last && typeof last.u7 === 'number' ? last.u7 : null;
+        const stale = last ? (Date.now() - new Date(last.ts).getTime()) / 1000 : null;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          status: expiresIn > 0 ? 'ok' : 'token_expired',
+          proxy: 'openclaw-billing-proxy',
+          version: VERSION,
+          subscriptionType: oauth.subscriptionType,
+          tokenExpiresInHours: isFinite(expiresIn) ? Number(expiresIn.toFixed(2)) : null,
+          requestsServed: requestCount,
+          usage: {
+            window_5h_pct: u5 == null ? null : Math.round(u5 * 100),
+            window_7d_pct: u7 == null ? null : Math.round(u7 * 100),
+            status: last ? last.s : null,
+            claim: last ? last.claim : null,
+            fallback_threshold_pct: last && typeof last.fb === 'number' ? Math.round(last.fb * 100) : null,
+            last_observed_at: last ? last.ts : null,
+            last_observed_age_seconds: stale == null ? null : Math.round(stale)
+          }
+        }));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'error', message: e.message }));
+      }
+      return;
+    }
+
     if (req.url === '/health' && req.method === 'GET') {
       try {
         const oauth = getToken(config.credsPath);
