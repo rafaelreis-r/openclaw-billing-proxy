@@ -898,7 +898,16 @@ function startServer(config) {
         } catch (_) {}
         const u5 = last && typeof last.u5 === 'number' ? last.u5 : null;
         const u7 = last && typeof last.u7 === 'number' ? last.u7 : null;
+        const uSon = last && typeof last.uSon === 'number' ? last.uSon : null;
         const stale = last ? (Date.now() - new Date(last.ts).getTime()) / 1000 : null;
+        const resetInfo = (epoch) => {
+          if (epoch == null || !isFinite(epoch)) return { at: null, in_seconds: null };
+          const ms = epoch > 1e12 ? epoch : epoch * 1000;
+          return { at: new Date(ms).toISOString(), in_seconds: Math.max(0, Math.round((ms - Date.now()) / 1000)) };
+        };
+        const r5 = resetInfo(last ? last.r5 : null);
+        const r7 = resetInfo(last ? last.r7 : null);
+        const rSon = resetInfo(last ? last.rSon : null);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           status: expiresIn > 0 ? 'ok' : 'token_expired',
@@ -908,8 +917,21 @@ function startServer(config) {
           tokenExpiresInHours: isFinite(expiresIn) ? Number(expiresIn.toFixed(2)) : null,
           requestsServed: requestCount,
           usage: {
-            window_5h_pct: u5 == null ? null : Math.round(u5 * 100),
-            window_7d_pct: u7 == null ? null : Math.round(u7 * 100),
+            session_5h: {
+              pct: u5 == null ? null : Math.round(u5 * 100),
+              resets_at: r5.at,
+              resets_in_seconds: r5.in_seconds
+            },
+            weekly_7d: {
+              pct: u7 == null ? null : Math.round(u7 * 100),
+              resets_at: r7.at,
+              resets_in_seconds: r7.in_seconds
+            },
+            sonnet_weekly: {
+              pct: uSon == null ? null : Math.round(uSon * 100),
+              resets_at: rSon.at,
+              resets_in_seconds: rSon.in_seconds
+            },
             status: last ? last.s : null,
             claim: last ? last.claim : null,
             fallback_threshold_pct: last && typeof last.fb === 'number' ? Math.round(last.fb * 100) : null,

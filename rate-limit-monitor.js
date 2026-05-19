@@ -52,9 +52,19 @@ function recordResponse(status, headers) {
   const st = headers['anthropic-ratelimit-unified-status'];
   const claim = headers['anthropic-ratelimit-unified-representative-claim'];
   const fb = num(headers['anthropic-ratelimit-unified-fallback-percentage']);
+  const r5 = num(headers['anthropic-ratelimit-unified-5h-reset']);
+  const r7 = num(headers['anthropic-ratelimit-unified-7d-reset']);
+  // Sonnet/Opus split (best-effort: capture if Anthropic exposes per-model)
+  const uSon = num(headers['anthropic-ratelimit-unified-sonnet-utilization']);
+  const rSon = num(headers['anthropic-ratelimit-unified-sonnet-reset']);
+  // Capture all anthropic-ratelimit-* headers for forensics on rare names
+  const allRl = {};
+  for (const k of Object.keys(headers)) {
+    if (k.toLowerCase().startsWith('anthropic-ratelimit-')) allRl[k] = headers[k];
+  }
 
   if (u5 != null || status === 429) {
-    const rec = { ts: new Date().toISOString(), st: status, u5, u7, claim, s: st, fb };
+    const rec = { ts: new Date().toISOString(), st: status, u5, u7, claim, s: st, fb, r5, r7, uSon, rSon, raw: allRl };
     fs.appendFile(LOG_PATH, JSON.stringify(rec) + '\n', () => {});
   }
 
